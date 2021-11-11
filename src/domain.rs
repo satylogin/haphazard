@@ -25,6 +25,13 @@ impl HazPtrDomain<Global> {
     }
 }
 
+#[macro_export]
+macro_rules! unique_domain {
+    () => {
+        HazPtrDomain::new(&|| {})
+    };
+}
+
 impl<F> HazPtrDomain<F> {
     pub const fn new(_: &F) -> Self {
         Self {
@@ -271,3 +278,19 @@ struct GlobalWriterLocalReaderShouldNotCompile;
 ///  let _ = unsafe { h.load(&x) }.unwrap();
 /// ```
 struct GlobalReaderLocalWriterShouldNotCompile;
+
+#[allow(dead_code)]
+/// ```compile_fail
+///  use std::sync::atomic::AtomicPtr;
+///  use haphazard::*;
+///
+///  let dw = unique_domain!();
+///  let dr = unique_domain!();
+///
+///  let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
+///
+///  let mut h = HazPtrHolder::for_domain(&dr);
+///
+///  let _ = unsafe { h.load(&x) }.unwrap();
+/// ```
+struct DomainWithDifferentFamilyShouldNotCompile;
