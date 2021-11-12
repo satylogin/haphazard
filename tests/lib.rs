@@ -17,24 +17,24 @@ fn test() {
     )));
 
     // As a reader:
-    let mut h = HazPtrHolder::global();
-    let my_x = unsafe { h.load(&x) }.unwrap();
+    let h = HazPtrHolder::global();
+    let my_x = unsafe { h.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
     h.reset();
-    // invalid:
-    // let _ = **my_x;
+    // no longer protected via hazptr, but since it was not retired, valid to use
+    assert_eq!(42, my_x.0);
 
-    let my_x = unsafe { h.load(&x) }.unwrap();
+    let my_x = unsafe { h.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
     drop(h);
     // invalid:
     // let _ = **my_x;
 
-    let mut h = HazPtrHolder::global();
-    let my_x = unsafe { h.load(&x) }.unwrap();
+    let h = HazPtrHolder::global();
+    let my_x = unsafe { h.protect(&x) }.unwrap();
 
-    let mut h_tmp = HazPtrHolder::global();
-    let _ = unsafe { h_tmp.load(&x) }.unwrap();
+    let h_tmp = HazPtrHolder::global();
+    let _ = unsafe { h_tmp.protect(&x) }.unwrap();
     drop(h_tmp);
 
     // As a writer:
@@ -46,8 +46,8 @@ fn test() {
         )))),
         Ordering::SeqCst,
     );
-    let mut h2 = HazPtrHolder::global();
-    let my_x2 = unsafe { h2.load(&x) }.unwrap();
+    let h2 = HazPtrHolder::global();
+    let my_x2 = unsafe { h2.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
     assert_eq!(9001, my_x2.0);
 
@@ -82,6 +82,6 @@ fn panics_when_domain_mismatch_between_reader_and_writer() {
         (42, CountDrops(Arc::clone(&drops_42))),
     ))));
 
-    let mut h = HazPtrHolder::for_domain(&dr);
-    let _ = unsafe { h.load(&x) }.unwrap();
+    let h = HazPtrHolder::for_domain(&dr);
+    let _ = unsafe { h.protect(&x) }.unwrap();
 }

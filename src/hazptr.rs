@@ -22,4 +22,12 @@ impl HazPtr {
     pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
+
+    pub(crate) fn reset(&self) {
+        self.ptr.store(std::ptr::null_mut(), Ordering::Release);
+    }
+
+    pub(crate) fn release(&self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
