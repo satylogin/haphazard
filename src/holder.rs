@@ -65,7 +65,7 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
         }
     }
 
-    pub fn reset(&self) {
+    pub fn reset_protection(&self) {
         self.hazard.reset()
     }
 
@@ -76,7 +76,7 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
 
 impl<F> Drop for HazPtrHolder<'_, F> {
     fn drop(&mut self) {
-        self.reset();
+        self.reset_protection();
         self.release();
     }
 }

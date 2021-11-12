@@ -20,7 +20,7 @@ fn test() {
     let h = HazPtrHolder::global();
     let my_x = unsafe { h.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
-    h.reset();
+    h.reset_protection();
     // no longer protected via hazptr, but since it was not retired, valid to use
     assert_eq!(42, my_x.0);
 
