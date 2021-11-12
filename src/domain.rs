@@ -2,7 +2,12 @@ use crate::deleter::{Deleter, Reclaim};
 use crate::hazptr::HazPtr;
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, Ordering};
+use std::time::Duration;
+
+const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
+const RCOUNT_THRESHOLD: isize = 1000;
+const HCOUNT_MULTIPLIER: isize = 2;
 
 #[non_exhaustive]
 pub struct Global;
@@ -11,12 +16,14 @@ impl Global {
         Global
     }
 }
+
 static SHARED_DOMAIN: HazPtrDomain<Global> = HazPtrDomain::new(&Global::new());
 
 pub struct HazPtrDomain<F> {
     hazptrs: HazPtrs,
     retired: RetiredList,
     family: PhantomData<F>,
+    next_reclaim_time: AtomicU64,
 }
 
 impl HazPtrDomain<Global> {
@@ -37,30 +44,21 @@ impl<F> HazPtrDomain<F> {
         Self {
             hazptrs: HazPtrs {
                 head: AtomicPtr::new(std::ptr::null_mut()),
+                count: AtomicIsize::new(0),
             },
             retired: RetiredList {
                 head: AtomicPtr::new(std::ptr::null_mut()),
-                count: AtomicUsize::new(0),
+                count: AtomicIsize::new(0),
             },
             family: PhantomData,
+            next_reclaim_time: AtomicU64::new(0),
         }
     }
 
     pub(crate) fn acquire(&self) -> &HazPtr {
-        let head_ptr = &self.hazptrs.head;
-        let mut node = head_ptr.load(Ordering::SeqCst);
-        loop {
-            while !node.is_null() && unsafe { &*node }.is_active() {
-                node = unsafe { &*node }.next.load(Ordering::SeqCst);
-            }
-            if node.is_null() {
-                break self.hazptrs.allocate();
-            } else {
-                let node = unsafe { &*node };
-                if node.maybe_activate() {
-                    break node;
-                }
-            }
+        match self.hazptrs.acquire_existing() {
+            Some(hazptr) => hazptr,
+            None => self.hazptrs.allocate(), // No existing free pointer.
         }
     }
 
@@ -71,78 +69,130 @@ impl<F> HazPtrDomain<F> {
     ) {
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
         self.retired.push(retired);
-
-        // TODO: better heuristics
-        if self.retired.count.load(Ordering::SeqCst) != 0 {
-            self.bulk_reclaim(false);
+        if self.is_time_to_reclaim() || self.reached_threshold() {
+            self.eager_reclaim(false);
         }
     }
 
-    pub fn eager_reclaim(&self, block: bool) -> usize {
-        self.bulk_reclaim(block)
+    fn is_time_to_reclaim(&self) -> bool {
+        use std::convert::TryFrom;
+
+        let time = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time is set to before the epoc")
+                .as_nanos(),
+        )
+        .expect("system time is too far in future");
+        let next_reclaim_time = self.next_reclaim_time.load(Ordering::Relaxed);
+
+        time > next_reclaim_time
+            && self
+                .next_reclaim_time
+                .compare_exchange(
+                    next_reclaim_time,
+                    time + RECLAIM_TIME_PERIOD,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
     }
 
-    fn bulk_reclaim(&self, block: bool) -> usize {
-        // TODO: add barrier here to ensure execution ordering.
+    fn reached_threshold(&self) -> bool {
+        let rc = self.retired.count();
+        rc >= RCOUNT_THRESHOLD || rc >= self.hazptrs.count() * HCOUNT_MULTIPLIER
+    }
+
+    pub fn eager_reclaim(&self, transitive: bool) -> isize {
         let mut reclaimed = 0;
         loop {
-            let mut node = self.retired.steal();
+            let steal = self.retired.steal();
+            if steal.is_null() {
+                break;
+            }
+            crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
             let protected = self.hazptrs.protected();
-            let mut beg = std::ptr::null_mut();
-            let mut end: *mut Retired = std::ptr::null_mut();
-            while !node.is_null() {
-                let n = unsafe { &mut *node };
-                let next_node = n.next.load(Ordering::Relaxed);
-                if protected.contains(&(n.ptr as *mut ())) {
-                    n.next.store(beg, Ordering::Relaxed);
-                    beg = node;
-                    if end.is_null() {
-                        end = beg;
-                    }
-                } else {
-                    let n = unsafe { Box::from_raw(node) };
-                    unsafe { n.deleter.delete(n.ptr) };
-                    reclaimed += 1;
-                }
-                node = next_node;
-            }
-            if !beg.is_null() {
-                self.retired.append(beg, end);
-            }
-            if !block || self.retired.is_empty() {
+            reclaimed += self.bulk_lookup_and_reclaim(steal, protected);
+            if self.retired.is_empty() || !transitive {
                 break;
             }
             std::thread::yield_now();
         }
-        self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
+
+        self.retired.count.fetch_sub(reclaimed, Ordering::Release);
+        reclaimed
+    }
+
+    fn bulk_lookup_and_reclaim(
+        &self,
+        mut node: *mut Retired,
+        protected: HashSet<*mut ()>,
+    ) -> isize {
+        let mut reclaimed = 0;
+        let mut beg = std::ptr::null_mut();
+        let mut end: *mut Retired = std::ptr::null_mut();
+        while !node.is_null() {
+            let n = unsafe { &mut *node };
+            let next_node = n.next;
+            debug_assert_ne!(node, next_node);
+            if !protected.contains(&(n.ptr as *mut ())) {
+                let n = unsafe { Box::from_raw(node) };
+                unsafe { n.deleter.delete(n.ptr) };
+                reclaimed += 1;
+                // TODO: support linked nodes for efficient deallocation.
+            } else {
+                n.next = beg;
+                beg = node;
+                if end.is_null() {
+                    end = beg;
+                }
+            }
+            node = next_node;
+        }
+        if !beg.is_null() {
+            self.retired.append(beg, end);
+        }
         reclaimed
     }
 }
 
 struct HazPtrs {
     head: AtomicPtr<HazPtr>,
+    count: AtomicIsize,
 }
 
 impl HazPtrs {
-    /// Allocate a new HazPtr.
-    fn allocate(&self) -> &'static HazPtr {
-        let hazptr = Box::into_raw(Box::new(HazPtr {
-            ptr: AtomicPtr::new(std::ptr::null_mut()),
-            next: AtomicPtr::new(std::ptr::null_mut()),
-            active: AtomicBool::new(true),
-        }));
-        self.push(hazptr)
+    fn count(&self) -> isize {
+        self.count.load(Ordering::Acquire)
     }
 
-    /// Push a node at list head.
-    fn push(&self, hazptr: *mut HazPtr) -> &'static HazPtr {
-        assert!(!hazptr.is_null());
-        let mut head = self.head.load(Ordering::SeqCst);
+    fn acquire_existing(&self) -> Option<&HazPtr> {
+        let mut node = self.head.load(Ordering::Acquire);
+        while !node.is_null() {
+            // Try to acquire existing.
+            let n = unsafe { &*node };
+            if n.maybe_activate() {
+                return Some(n);
+            }
+            node = n.next;
+        }
+        None
+    }
+
+    /// Allocate a new HazPtr.
+    fn allocate(&self) -> &HazPtr {
+        let hazptr = Box::into_raw(Box::new(HazPtr {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            next: std::ptr::null_mut(),
+            active: AtomicBool::new(true),
+        }));
+        self.count.fetch_add(1, Ordering::Release);
+        let mut head = self.head.load(Ordering::Acquire);
         loop {
-            *unsafe { &mut *hazptr }.next.get_mut() = head;
+            unsafe { &mut *hazptr }.next = head;
             match self
                 .head
-                .compare_exchange_weak(head, hazptr, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange_weak(head, hazptr, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break unsafe { &*hazptr },
                 Err(new_head) => head = new_head,
@@ -153,13 +203,13 @@ impl HazPtrs {
     /// Fetch all HazPtr which are active.
     fn protected(&self) -> HashSet<*mut ()> {
         let mut protected = HashSet::new();
-        let mut node = self.head.load(Ordering::SeqCst);
+        let mut node = self.head.load(Ordering::Acquire);
         while !node.is_null() {
             let n = unsafe { &*node };
             if n.is_active() {
-                protected.insert(n.ptr.load(Ordering::SeqCst));
+                protected.insert(n.ptr.load(Ordering::Acquire));
             }
-            node = n.next.load(Ordering::SeqCst);
+            node = n.next;
         }
         protected
     }
@@ -169,8 +219,7 @@ impl Drop for HazPtrs {
     fn drop(&mut self) {
         let mut node = *self.head.get_mut();
         while !node.is_null() {
-            let mut ptr = unsafe { Box::from_raw(node) };
-            node = *ptr.next.get_mut();
+            node = unsafe { Box::from_raw(node) }.next;
         }
     }
 }
@@ -189,7 +238,7 @@ struct Retired {
     // This is 'domain which is enforced anything that constructs a Retired.
     ptr: *mut dyn Reclaim,
     deleter: &'static dyn Deleter,
-    next: AtomicPtr<Retired>,
+    next: *mut Retired,
 }
 
 impl Retired {
@@ -204,23 +253,31 @@ impl Retired {
         Retired {
             ptr: unsafe { std::mem::transmute::<_, *mut (dyn Reclaim + 'static)>(ptr) },
             deleter,
-            next: AtomicPtr::default(),
+            next: std::ptr::null_mut(),
         }
     }
 }
 
 struct RetiredList {
     head: AtomicPtr<Retired>,
-    count: AtomicUsize,
+    count: AtomicIsize,
 }
 
 impl RetiredList {
     fn is_empty(&self) -> bool {
-        self.head.load(Ordering::SeqCst).is_null()
+        self.head.load(Ordering::Acquire).is_null()
+    }
+
+    fn count(&self) -> isize {
+        self.count.load(Ordering::Acquire)
     }
 
     fn push(&self, retired: *mut Retired) {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        self.count.fetch_add(1, Ordering::Release);
+        // We cannot mess with order here since if the addition is done after push, it could happen
+        // that another thread reclaims the memory before addition happens, and usize can panic if
+        // becomes negative as result off that.
+        crate::asymmetric_light_barrier();
         self.append(retired, retired);
     }
 
@@ -228,12 +285,12 @@ impl RetiredList {
     fn append(&self, beg: *mut Retired, end: *mut Retired) {
         assert!(!beg.is_null());
         assert!(!end.is_null());
-        let mut head = self.head.load(Ordering::SeqCst);
+        let mut head = self.head.load(Ordering::Acquire);
         loop {
-            *unsafe { &mut *end }.next.get_mut() = head;
+            unsafe { &mut *end }.next = head;
             match self
                 .head
-                .compare_exchange_weak(head, beg, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange_weak(head, beg, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(new_head) => head = new_head,
@@ -243,11 +300,10 @@ impl RetiredList {
 
     // This does not decrease count due to race condition.
     fn steal(&self) -> *mut Retired {
-        self.head.swap(std::ptr::null_mut(), Ordering::SeqCst)
+        self.head.swap(std::ptr::null_mut(), Ordering::Acquire)
     }
 }
 
-#[allow(dead_code)]
 /// ```compile_fail
 ///  use std::sync::atomic::AtomicPtr;
 ///  use haphazard::*;
@@ -261,9 +317,9 @@ impl RetiredList {
 ///
 ///  let _ = unsafe { h.load(&x) }.unwrap();
 /// ```
+#[cfg(doctest)]
 struct GlobalWriterLocalReaderShouldNotCompile;
 
-#[allow(dead_code)]
 /// ```compile_fail
 ///  use std::sync::atomic::AtomicPtr;
 ///  use haphazard::*;
@@ -277,9 +333,9 @@ struct GlobalWriterLocalReaderShouldNotCompile;
 ///
 ///  let _ = unsafe { h.load(&x) }.unwrap();
 /// ```
+#[cfg(doctest)]
 struct GlobalReaderLocalWriterShouldNotCompile;
 
-#[allow(dead_code)]
 /// ```compile_fail
 ///  use std::sync::atomic::AtomicPtr;
 ///  use haphazard::*;
@@ -293,4 +349,5 @@ struct GlobalReaderLocalWriterShouldNotCompile;
 ///
 ///  let _ = unsafe { h.load(&x) }.unwrap();
 /// ```
+#[cfg(doctest)]
 struct DomainWithDifferentFamilyShouldNotCompile;
