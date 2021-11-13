@@ -252,7 +252,6 @@ impl<F> Drop for Domain<F> {
 }
 
 struct Retired {
-    // pointer to data that HazPtr protectes
     // This is 'domain which is enforced anything that constructs a Retired.
     ptr: *mut dyn Reclaim,
     deleter: &'static dyn Deleter,
