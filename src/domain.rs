@@ -5,6 +5,19 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Returns system time in nano sec as u64
+fn unix_epoc_nano() -> u64 {
+    use std::convert::TryFrom;
+
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is set to before the epoc")
+            .as_nanos(),
+    )
+    .expect("system time is too far in future")
+}
+
 const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
 const RCOUNT_THRESHOLD: isize = 1000;
 const HCOUNT_MULTIPLIER: isize = 2;
@@ -21,9 +34,9 @@ static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
 
 pub struct Domain<F> {
     hazptrs: HazPtrRecords,
-    retired: RetiredList,
+    untagged: RetiredList,
     family: PhantomData<F>,
-    next_reclaim_time: AtomicU64,
+    due_time: AtomicU64,
 }
 
 impl Domain<Global> {
@@ -46,12 +59,12 @@ impl<F> Domain<F> {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
-            retired: RetiredList {
+            untagged: RetiredList {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
             family: PhantomData,
-            next_reclaim_time: AtomicU64::new(0),
+            due_time: AtomicU64::new(0),
         }
     }
 
@@ -68,29 +81,21 @@ impl<F> Domain<F> {
         deleter: &'static dyn Deleter,
     ) {
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
-        self.retired.push(retired);
+        self.untagged.push(retired);
         if self.is_time_to_reclaim() || self.reached_threshold() {
             self.eager_reclaim(false);
         }
     }
 
     fn is_time_to_reclaim(&self) -> bool {
-        use std::convert::TryFrom;
+        let time = unix_epoc_nano();
+        let due_time = self.due_time.load(Ordering::Relaxed);
 
-        let time = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time is set to before the epoc")
-                .as_nanos(),
-        )
-        .expect("system time is too far in future");
-        let next_reclaim_time = self.next_reclaim_time.load(Ordering::Relaxed);
-
-        time > next_reclaim_time
+        time > due_time
             && self
-                .next_reclaim_time
+                .due_time
                 .compare_exchange(
-                    next_reclaim_time,
+                    due_time,
                     time + RECLAIM_TIME_PERIOD,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -99,27 +104,26 @@ impl<F> Domain<F> {
     }
 
     fn reached_threshold(&self) -> bool {
-        let rc = self.retired.count();
-        rc >= RCOUNT_THRESHOLD || rc >= self.hazptrs.count() * HCOUNT_MULTIPLIER
+        self.untagged.count() >= RCOUNT_THRESHOLD.max(HCOUNT_MULTIPLIER * self.hazptrs.count())
     }
 
     pub fn eager_reclaim(&self, transitive: bool) -> isize {
         let mut reclaimed = 0;
         loop {
-            let steal = self.retired.steal();
+            let steal = self.untagged.steal();
             if steal.is_null() {
                 break;
             }
             crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
             let protected = self.hazptrs.protected();
             reclaimed += self.bulk_lookup_and_reclaim(steal, protected);
-            if self.retired.is_empty() || !transitive {
+            if self.untagged.is_empty() || !transitive {
                 break;
             }
             std::thread::yield_now();
         }
+        self.untagged.count.fetch_sub(reclaimed, Ordering::Release);
 
-        self.retired.count.fetch_sub(reclaimed, Ordering::Release);
         reclaimed
     }
 
@@ -149,9 +153,7 @@ impl<F> Domain<F> {
             }
             node = next_node;
         }
-        if !beg.is_null() {
-            self.retired.append(beg, end);
-        }
+        unsafe { self.untagged.append(beg, end) };
         reclaimed
     }
 }
@@ -226,10 +228,10 @@ impl Drop for HazPtrRecords {
 
 impl<F> Drop for Domain<F> {
     fn drop(&mut self) {
-        let n_retired = *self.retired.count.get_mut();
+        let n_retired = *self.untagged.count.get_mut();
         let n_reclaimed = self.eager_reclaim(false);
         debug_assert_eq!(n_retired, n_reclaimed);
-        debug_assert!(self.retired.head.get_mut().is_null());
+        debug_assert!(self.untagged.head.get_mut().is_null());
     }
 }
 
@@ -275,18 +277,23 @@ impl RetiredList {
     fn push(&self, retired: *mut Retired) {
         self.count.fetch_add(1, Ordering::Release);
         // We cannot mess with order here since if the addition is done after push, it could happen
-        // that another thread reclaims the memory before addition happens, and usize can panic if
-        // becomes negative as result off that.
+        // that another thread reclaims the memory before addition happens, which will make count
+        // negative.
         crate::asymmetric_light_barrier();
-        self.append(retired, retired);
+        unsafe { self.append(retired, retired) };
     }
 
-    // This does not alter count, and should be taken care by the caller.
-    fn append(&self, beg: *mut Retired, end: *mut Retired) {
-        assert!(!beg.is_null());
-        assert!(!end.is_null());
+    /// This does not alter count which should be taken care by the caller.
+    ///
+    /// Safety:
+    /// 1. Caller sould ensure that `beg` and `end` corresponds to a valid linked list.
+    unsafe fn append(&self, beg: *mut Retired, end: *mut Retired) {
+        if beg.is_null() {
+            return;
+        }
         let mut head = self.head.load(Ordering::Acquire);
         loop {
+            // SAFETY: by safety guarantee on function.
             unsafe { &mut *end }.next = head;
             match self
                 .head
@@ -298,7 +305,7 @@ impl RetiredList {
         }
     }
 
-    // This does not decrease count due to race condition.
+    // This does not decrease count. subtraction in only done for objects that are retired.
     fn steal(&self) -> *mut Retired {
         self.head.swap(std::ptr::null_mut(), Ordering::Acquire)
     }

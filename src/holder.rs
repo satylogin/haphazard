@@ -68,15 +68,10 @@ impl<'domain, F> HazardPointer<'domain, F> {
     pub fn reset_protection(&self) {
         self.hazard.reset()
     }
-
-    pub fn release(&self) {
-        self.hazard.release();
-    }
 }
 
 impl<F> Drop for HazardPointer<'_, F> {
     fn drop(&mut self) {
-        self.reset_protection();
-        self.release();
+        self.hazard.release();
     }
 }
