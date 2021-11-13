@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-pub(crate) struct HazPtr {
+pub(crate) struct HazPtrRecord {
     pub(crate) ptr: AtomicPtr<()>,
-    pub(crate) next: *mut HazPtr,
+    pub(crate) next: *mut HazPtrRecord,
     pub(crate) active: AtomicBool,
 }
 
-impl HazPtr {
+impl HazPtrRecord {
     pub(crate) fn protect(&self, ptr: *mut ()) {
         self.ptr.store(ptr, Ordering::Release);
     }

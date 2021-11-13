@@ -1,20 +1,20 @@
-use crate::hazptr::HazPtr;
-use crate::{HazPtrDomain, HazPtrObject};
+use crate::record::HazPtrRecord;
+use crate::{Domain, HazPtrObject};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-pub struct HazPtrHolder<'domain, F> {
-    hazard: &'domain HazPtr,
-    domain: &'domain HazPtrDomain<F>,
+pub struct HazardPointer<'domain, F> {
+    hazard: &'domain HazPtrRecord,
+    domain: &'domain Domain<F>,
 }
 
-impl HazPtrHolder<'static, crate::Global> {
-    pub fn global() -> Self {
-        HazPtrHolder::for_domain(HazPtrDomain::global())
+impl HazardPointer<'static, crate::Global> {
+    pub fn make_global() -> Self {
+        HazardPointer::make_in_domain(Domain::global())
     }
 }
 
-impl<'domain, F> HazPtrHolder<'domain, F> {
-    pub fn for_domain(domain: &'domain HazPtrDomain<F>) -> Self {
+impl<'domain, F> HazardPointer<'domain, F> {
+    pub fn make_in_domain(domain: &'domain Domain<F>) -> Self {
         Self {
             hazard: domain.acquire(),
             domain,
@@ -38,8 +38,8 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
             Ok(std::ptr::NonNull::new(actual).map(|nn| {
                 let r = unsafe { nn.as_ref() };
                 debug_assert_eq!(
-                    self.domain as *const HazPtrDomain<F>,
-                    r.domain() as *const HazPtrDomain<F>,
+                    self.domain as *const Domain<F>,
+                    r.domain() as *const Domain<F>,
                     "object guarded by different domain than holder used to access it."
                 );
                 r
@@ -74,7 +74,7 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
     }
 }
 
-impl<F> Drop for HazPtrHolder<'_, F> {
+impl<F> Drop for HazardPointer<'_, F> {
     fn drop(&mut self) {
         self.reset_protection();
         self.release();

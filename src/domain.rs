@@ -1,5 +1,5 @@
 use crate::deleter::{Deleter, Reclaim};
-use crate::hazptr::HazPtr;
+use crate::record::HazPtrRecord;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, Ordering};
@@ -17,16 +17,16 @@ impl Global {
     }
 }
 
-static SHARED_DOMAIN: HazPtrDomain<Global> = HazPtrDomain::new(&Global::new());
+static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
 
-pub struct HazPtrDomain<F> {
-    hazptrs: HazPtrs,
+pub struct Domain<F> {
+    hazptrs: HazPtrRecords,
     retired: RetiredList,
     family: PhantomData<F>,
     next_reclaim_time: AtomicU64,
 }
 
-impl HazPtrDomain<Global> {
+impl Domain<Global> {
     pub fn global() -> &'static Self {
         &SHARED_DOMAIN
     }
@@ -35,14 +35,14 @@ impl HazPtrDomain<Global> {
 #[macro_export]
 macro_rules! unique_domain {
     () => {
-        HazPtrDomain::new(&|| {})
+        Domain::new(&|| {})
     };
 }
 
-impl<F> HazPtrDomain<F> {
+impl<F> Domain<F> {
     pub const fn new(_: &F) -> Self {
         Self {
-            hazptrs: HazPtrs {
+            hazptrs: HazPtrRecords {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
@@ -55,7 +55,7 @@ impl<F> HazPtrDomain<F> {
         }
     }
 
-    pub(crate) fn acquire(&self) -> &HazPtr {
+    pub(crate) fn acquire(&self) -> &HazPtrRecord {
         match self.hazptrs.acquire_existing() {
             Some(hazptr) => hazptr,
             None => self.hazptrs.allocate(), // No existing free pointer.
@@ -156,17 +156,17 @@ impl<F> HazPtrDomain<F> {
     }
 }
 
-struct HazPtrs {
-    head: AtomicPtr<HazPtr>,
+struct HazPtrRecords {
+    head: AtomicPtr<HazPtrRecord>,
     count: AtomicIsize,
 }
 
-impl HazPtrs {
+impl HazPtrRecords {
     fn count(&self) -> isize {
         self.count.load(Ordering::Acquire)
     }
 
-    fn acquire_existing(&self) -> Option<&HazPtr> {
+    fn acquire_existing(&self) -> Option<&HazPtrRecord> {
         let mut node = self.head.load(Ordering::Acquire);
         while !node.is_null() {
             // Try to acquire existing.
@@ -180,8 +180,8 @@ impl HazPtrs {
     }
 
     /// Allocate a new HazPtr.
-    fn allocate(&self) -> &HazPtr {
-        let hazptr = Box::into_raw(Box::new(HazPtr {
+    fn allocate(&self) -> &HazPtrRecord {
+        let hazptr = Box::into_raw(Box::new(HazPtrRecord {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
             next: std::ptr::null_mut(),
             active: AtomicBool::new(true),
@@ -215,7 +215,7 @@ impl HazPtrs {
     }
 }
 
-impl Drop for HazPtrs {
+impl Drop for HazPtrRecords {
     fn drop(&mut self) {
         let mut node = *self.head.get_mut();
         while !node.is_null() {
@@ -224,7 +224,7 @@ impl Drop for HazPtrs {
     }
 }
 
-impl<F> Drop for HazPtrDomain<F> {
+impl<F> Drop for Domain<F> {
     fn drop(&mut self) {
         let n_retired = *self.retired.count.get_mut();
         let n_reclaimed = self.eager_reclaim(false);
@@ -246,7 +246,7 @@ impl Retired {
     ///
     /// `ptr` will not be accessed after `'domain` ends.
     unsafe fn new<'domain, F>(
-        _: &'domain HazPtrDomain<F>,
+        _: &'domain Domain<F>,
         ptr: *mut (dyn Reclaim + 'domain),
         deleter: &'static dyn Deleter,
     ) -> Self {
@@ -308,14 +308,14 @@ impl RetiredList {
 ///  use std::sync::atomic::AtomicPtr;
 ///  use haphazard::*;
 ///
-///  let dw = HazPtrDomain::global();
-///  let dr = HazPtrDomain::new(&());
+///  let dw = Domain::global();
+///  let dr = Domain::new(&());
 ///
 ///  let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
 ///
-///  let mut h = HazPtrHolder::for_domain(&dr);
+///  let mut h = HazardPointer::make_in_domain(&dr);
 ///
-///  let _ = unsafe { h.load(&x) }.unwrap();
+///  let _ = unsafe { h.protect(&x) }.unwrap();
 /// ```
 #[cfg(doctest)]
 struct GlobalWriterLocalReaderShouldNotCompile;
@@ -324,14 +324,14 @@ struct GlobalWriterLocalReaderShouldNotCompile;
 ///  use std::sync::atomic::AtomicPtr;
 ///  use haphazard::*;
 ///
-///  let dw = HazPtrDomain::new(&());
-///  let dr = HazPtrDomain::global();
+///  let dw = Domain::new(&());
+///  let dr = Domain::global();
 ///
 ///  let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
 ///
-///  let mut h = HazPtrHolder::for_domain(&dr);
+///  let mut h = HazardPointer::make_in_domain(&dr);
 ///
-///  let _ = unsafe { h.load(&x) }.unwrap();
+///  let _ = unsafe { h.protect(&x) }.unwrap();
 /// ```
 #[cfg(doctest)]
 struct GlobalReaderLocalWriterShouldNotCompile;
@@ -345,9 +345,9 @@ struct GlobalReaderLocalWriterShouldNotCompile;
 ///
 ///  let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
 ///
-///  let mut h = HazPtrHolder::for_domain(&dr);
+///  let mut h = HazardPointer::make_in_domain(&dr);
 ///
-///  let _ = unsafe { h.load(&x) }.unwrap();
+///  let _ = unsafe { h.protect(&x) }.unwrap();
 /// ```
 #[cfg(doctest)]
 struct DomainWithDifferentFamilyShouldNotCompile;

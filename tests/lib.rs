@@ -17,7 +17,7 @@ fn test() {
     )));
 
     // As a reader:
-    let h = HazPtrHolder::global();
+    let h = HazardPointer::make_global();
     let my_x = unsafe { h.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
     h.reset_protection();
@@ -30,10 +30,10 @@ fn test() {
     // invalid:
     // let _ = **my_x;
 
-    let h = HazPtrHolder::global();
+    let h = HazardPointer::make_global();
     let my_x = unsafe { h.protect(&x) }.unwrap();
 
-    let h_tmp = HazPtrHolder::global();
+    let h_tmp = HazardPointer::make_global();
     let _ = unsafe { h_tmp.protect(&x) }.unwrap();
     drop(h_tmp);
 
@@ -46,7 +46,7 @@ fn test() {
         )))),
         Ordering::SeqCst,
     );
-    let h2 = HazPtrHolder::global();
+    let h2 = HazardPointer::make_global();
     let my_x2 = unsafe { h2.protect(&x) }.unwrap();
     assert_eq!(42, my_x.0);
     assert_eq!(9001, my_x2.0);
@@ -55,26 +55,26 @@ fn test() {
     assert_eq!(42, my_x.0);
     assert_eq!(0, drops_42.load(Ordering::SeqCst));
 
-    assert_eq!(0, HazPtrDomain::global().eager_reclaim(false));
+    assert_eq!(0, Domain::global().eager_reclaim(false));
     assert_eq!(42, my_x.0);
     assert_eq!(0, drops_42.load(Ordering::SeqCst));
 
     drop(h);
     assert_eq!(0, drops_42.load(Ordering::SeqCst));
-    assert_eq!(1, HazPtrDomain::global().eager_reclaim(false));
+    assert_eq!(1, Domain::global().eager_reclaim(false));
     assert_eq!(1, drops_42.load(Ordering::SeqCst));
     assert_eq!(0, drops_9001.load(Ordering::SeqCst));
 
     drop(h2);
-    assert_eq!(0, HazPtrDomain::global().eager_reclaim(false));
+    assert_eq!(0, Domain::global().eager_reclaim(false));
     assert_eq!(0, drops_9001.load(Ordering::SeqCst));
 }
 
 #[test]
 #[should_panic]
 fn panics_when_domain_mismatch_between_reader_and_writer() {
-    let dw = HazPtrDomain::new(&());
-    let dr = HazPtrDomain::new(&());
+    let dw = Domain::new(&());
+    let dr = Domain::new(&());
 
     let drops_42 = Arc::new(AtomicUsize::new(0));
     let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(
@@ -82,6 +82,6 @@ fn panics_when_domain_mismatch_between_reader_and_writer() {
         (42, CountDrops(Arc::clone(&drops_42))),
     ))));
 
-    let h = HazPtrHolder::for_domain(&dr);
+    let h = HazardPointer::make_in_domain(&dr);
     let _ = unsafe { h.protect(&x) }.unwrap();
 }
