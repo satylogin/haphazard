@@ -5,6 +5,13 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
+const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
+const RCOUNT_THRESHOLD: isize = 1000;
+const HCOUNT_MULTIPLIER: isize = 2;
+const NUM_SHARDS: usize = 8;
+const IGNORE_LOW_BITS: usize = 8;
+const SHARD_MASK: usize = NUM_SHARDS - 1;
+
 /// Returns system time in nano sec as u64
 fn unix_epoc_nano() -> u64 {
     use std::convert::TryFrom;
@@ -18,9 +25,9 @@ fn unix_epoc_nano() -> u64 {
     .expect("system time is too far in future")
 }
 
-const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
-const RCOUNT_THRESHOLD: isize = 1000;
-const HCOUNT_MULTIPLIER: isize = 2;
+fn calc_shard(input: *mut Retired) -> usize {
+    (input as usize >> IGNORE_LOW_BITS) & SHARD_MASK
+}
 
 #[non_exhaustive]
 pub struct Global;
@@ -34,7 +41,7 @@ static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
 
 pub struct Domain<F> {
     hazptrs: HazPtrRecords,
-    untagged: RetiredList,
+    untagged: [RetiredList; NUM_SHARDS],
     family: PhantomData<F>,
     due_time: AtomicU64,
     count: AtomicIsize,
@@ -56,14 +63,13 @@ macro_rules! unique_domain {
 
 impl<F> Domain<F> {
     pub const fn new(_: &F) -> Self {
+        const RETIRED_LIST: RetiredList = RetiredList::new();
         Self {
             hazptrs: HazPtrRecords {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
-            untagged: RetiredList {
-                head: AtomicPtr::new(std::ptr::null_mut()),
-            },
+            untagged: [RETIRED_LIST; NUM_SHARDS],
             family: PhantomData,
             due_time: AtomicU64::new(0),
             count: AtomicIsize::new(0),
@@ -85,7 +91,7 @@ impl<F> Domain<F> {
     ) {
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
         self.count.fetch_add(1, Ordering::Release);
-        self.untagged.push(retired);
+        self.untagged[calc_shard(retired)].push(retired);
         if self.is_time_to_reclaim() || self.reached_threshold() {
             self.eager_reclaim(false);
         }
@@ -112,16 +118,22 @@ impl<F> Domain<F> {
     }
 
     pub fn eager_reclaim(&self, transitive: bool) -> isize {
+        (0..NUM_SHARDS)
+            .map(|shard| self.reclaim_shard(shard, transitive))
+            .sum()
+    }
+
+    fn reclaim_shard(&self, shard: usize, transitive: bool) -> isize {
         let mut reclaimed = 0;
         loop {
-            let steal = self.untagged.steal();
+            let steal = self.untagged[shard].steal();
             if steal.is_null() {
                 break;
             }
             crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
             let protected = self.hazptrs.protected();
-            reclaimed += self.bulk_lookup_and_reclaim(steal, protected);
-            if self.untagged.is_empty() || !transitive {
+            reclaimed += self.bulk_lookup_and_reclaim(shard, steal, protected);
+            if self.untagged[shard].is_empty() || !transitive {
                 break;
             } else {
                 std::thread::yield_now();
@@ -134,8 +146,13 @@ impl<F> Domain<F> {
         reclaimed
     }
 
-    fn bulk_lookup_and_reclaim(&self, steal: *mut Retired, protected: HashSet<*mut ()>) -> isize {
-        let reclaimable = self.reclaimable(steal, protected);
+    fn bulk_lookup_and_reclaim(
+        &self,
+        shard: usize,
+        steal: *mut Retired,
+        protected: HashSet<*mut ()>,
+    ) -> isize {
+        let reclaimable = self.reclaimable(shard, steal, protected);
         for node in &reclaimable {
             let node = unsafe { Box::from_raw(*node) };
             unsafe { node.deleter.delete(node.ptr) };
@@ -143,7 +160,12 @@ impl<F> Domain<F> {
         reclaimable.len() as isize
     }
 
-    fn reclaimable(&self, steal: *mut Retired, protected: HashSet<*mut ()>) -> Vec<*mut Retired> {
+    fn reclaimable(
+        &self,
+        shard: usize,
+        steal: *mut Retired,
+        protected: HashSet<*mut ()>,
+    ) -> Vec<*mut Retired> {
         let mut remaining_head = std::ptr::null_mut();
         let mut remaining_tail: *mut Retired = std::ptr::null_mut();
         let mut reclaimable = vec![];
@@ -163,7 +185,7 @@ impl<F> Domain<F> {
             }
             node = next_node;
         }
-        unsafe { self.untagged.append(remaining_head, remaining_tail) };
+        unsafe { self.untagged[shard].append(remaining_head, remaining_tail) };
 
         reclaimable
     }
@@ -247,7 +269,6 @@ impl<F> Drop for Domain<F> {
         let n_retired = *self.count.get_mut();
         let n_reclaimed = self.eager_reclaim(true);
         debug_assert_eq!(n_retired, n_reclaimed);
-        debug_assert!(self.untagged.head.get_mut().is_null());
     }
 }
 
@@ -280,6 +301,12 @@ struct RetiredList {
 }
 
 impl RetiredList {
+    const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire).is_null()
     }
