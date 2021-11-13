@@ -21,7 +21,6 @@ pub(crate) fn asymmetric_light_barrier() {
 }
 
 pub(crate) enum HeavyBarrierKind {
-    Normal,
     Expedited,
 }
 

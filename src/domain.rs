@@ -37,6 +37,8 @@ pub struct Domain<F> {
     untagged: RetiredList,
     family: PhantomData<F>,
     due_time: AtomicU64,
+    count: AtomicIsize,
+    shutdown: bool,
 }
 
 impl Domain<Global> {
@@ -61,10 +63,11 @@ impl<F> Domain<F> {
             },
             untagged: RetiredList {
                 head: AtomicPtr::new(std::ptr::null_mut()),
-                count: AtomicIsize::new(0),
             },
             family: PhantomData,
             due_time: AtomicU64::new(0),
+            count: AtomicIsize::new(0),
+            shutdown: false,
         }
     }
 
@@ -81,6 +84,7 @@ impl<F> Domain<F> {
         deleter: &'static dyn Deleter,
     ) {
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
+        self.count.fetch_add(1, Ordering::Release);
         self.untagged.push(retired);
         if self.is_time_to_reclaim() || self.reached_threshold() {
             self.eager_reclaim(false);
@@ -104,7 +108,7 @@ impl<F> Domain<F> {
     }
 
     fn reached_threshold(&self) -> bool {
-        self.untagged.count() >= RCOUNT_THRESHOLD.max(HCOUNT_MULTIPLIER * self.hazptrs.count())
+        self.count() >= RCOUNT_THRESHOLD.max(HCOUNT_MULTIPLIER * self.hazptrs.count())
     }
 
     pub fn eager_reclaim(&self, transitive: bool) -> isize {
@@ -119,42 +123,53 @@ impl<F> Domain<F> {
             reclaimed += self.bulk_lookup_and_reclaim(steal, protected);
             if self.untagged.is_empty() || !transitive {
                 break;
+            } else {
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
         }
-        self.untagged.count.fetch_sub(reclaimed, Ordering::Release);
+        if reclaimed != 0 {
+            self.count.fetch_sub(reclaimed, Ordering::Release);
+        }
 
         reclaimed
     }
 
-    fn bulk_lookup_and_reclaim(
-        &self,
-        mut node: *mut Retired,
-        protected: HashSet<*mut ()>,
-    ) -> isize {
-        let mut reclaimed = 0;
-        let mut beg = std::ptr::null_mut();
-        let mut end: *mut Retired = std::ptr::null_mut();
+    fn bulk_lookup_and_reclaim(&self, steal: *mut Retired, protected: HashSet<*mut ()>) -> isize {
+        let reclaimable = self.reclaimable(steal, protected);
+        for node in &reclaimable {
+            let node = unsafe { Box::from_raw(*node) };
+            unsafe { node.deleter.delete(node.ptr) };
+        }
+        reclaimable.len() as isize
+    }
+
+    fn reclaimable(&self, steal: *mut Retired, protected: HashSet<*mut ()>) -> Vec<*mut Retired> {
+        let mut remaining_head = std::ptr::null_mut();
+        let mut remaining_tail: *mut Retired = std::ptr::null_mut();
+        let mut reclaimable = vec![];
+        let mut node = steal;
         while !node.is_null() {
             let n = unsafe { &mut *node };
             let next_node = n.next;
             debug_assert_ne!(node, next_node);
             if !protected.contains(&(n.ptr as *mut ())) {
-                let n = unsafe { Box::from_raw(node) };
-                unsafe { n.deleter.delete(n.ptr) };
-                reclaimed += 1;
-                // TODO: support linked nodes for efficient deallocation.
+                reclaimable.push(node);
             } else {
-                n.next = beg;
-                beg = node;
-                if end.is_null() {
-                    end = beg;
+                n.next = remaining_head;
+                remaining_head = node;
+                if remaining_tail.is_null() {
+                    remaining_tail = remaining_head;
                 }
             }
             node = next_node;
         }
-        unsafe { self.untagged.append(beg, end) };
-        reclaimed
+        unsafe { self.untagged.append(remaining_head, remaining_tail) };
+
+        reclaimable
+    }
+
+    fn count(&self) -> isize {
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -228,8 +243,9 @@ impl Drop for HazPtrRecords {
 
 impl<F> Drop for Domain<F> {
     fn drop(&mut self) {
-        let n_retired = *self.untagged.count.get_mut();
-        let n_reclaimed = self.eager_reclaim(false);
+        self.shutdown = true;
+        let n_retired = *self.count.get_mut();
+        let n_reclaimed = self.eager_reclaim(true);
         debug_assert_eq!(n_retired, n_reclaimed);
         debug_assert!(self.untagged.head.get_mut().is_null());
     }
@@ -262,7 +278,6 @@ impl Retired {
 
 struct RetiredList {
     head: AtomicPtr<Retired>,
-    count: AtomicIsize,
 }
 
 impl RetiredList {
@@ -270,16 +285,8 @@ impl RetiredList {
         self.head.load(Ordering::Acquire).is_null()
     }
 
-    fn count(&self) -> isize {
-        self.count.load(Ordering::Acquire)
-    }
-
     fn push(&self, retired: *mut Retired) {
-        self.count.fetch_add(1, Ordering::Release);
-        // We cannot mess with order here since if the addition is done after push, it could happen
-        // that another thread reclaims the memory before addition happens, which will make count
-        // negative.
-        crate::asymmetric_light_barrier();
+        // SAFETY: pointers are valid since we own them.
         unsafe { self.append(retired, retired) };
     }
 
