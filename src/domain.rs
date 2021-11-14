@@ -2,7 +2,7 @@ use crate::deleter::{Deleter, Reclaim};
 use crate::record::HazPtrRecord;
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
@@ -11,6 +11,7 @@ const HCOUNT_MULTIPLIER: isize = 2;
 const NUM_SHARDS: usize = 8;
 const IGNORE_LOW_BITS: usize = 8;
 const SHARD_MASK: usize = NUM_SHARDS - 1;
+const LOCK_BIT: usize = 1;
 
 /// Returns system time in nano sec as u64
 fn unix_epoc_nano() -> u64 {
@@ -67,6 +68,7 @@ impl<F> Domain<F> {
         Self {
             hazptrs: HazPtrRecords {
                 head: AtomicPtr::new(std::ptr::null_mut()),
+                available: AtomicUsize::new(0),
                 count: AtomicIsize::new(0),
             },
             untagged: [RETIRED_LIST; NUM_SHARDS],
@@ -78,20 +80,46 @@ impl<F> Domain<F> {
     }
 
     pub(crate) fn acquire(&self) -> &HazPtrRecord {
-        match self.hazptrs.acquire_existing() {
-            Some(hazptr) => hazptr,
-            None => self.hazptrs.allocate(), // No existing free pointer.
-        }
+        self.acquire_many::<1>()[0]
     }
 
+    pub(crate) fn acquire_many<const N: usize>(&self) -> [&HazPtrRecord; N] {
+        let mut available = self.hazptrs.try_acquire_available::<N>();
+        [(); N].map(|_| {
+            if !available.is_null() {
+                let rec = available;
+                // SAFETY: `HazPtrRecord`s are never deallocated unless domain is dropped.
+                available = unsafe { &*available }.next_available;
+                // SAFETY: `HazPtrRecord`s are never deallocated unless domain is dropped.
+                unsafe { &*rec }
+            } else {
+                self.hazptrs.allocate()
+            }
+        })
+    }
+
+    pub(crate) fn release(&self, rec: &HazPtrRecord) {
+        self.release_many::<1>([rec])
+    }
+
+    pub(crate) fn release_many<const N: usize>(&self, recs: [&HazPtrRecord; N]) {
+        self.hazptrs.push_available::<N>(recs);
+    }
+
+    /// # Safety
+    /// 1. ptr should be a valid pointer.
+    /// 2. ptr should not be accessed after calling retire on it. Readers who already have access
+    ///    to it can keep on reading it.
     pub(crate) unsafe fn retire<'domain>(
         &'domain self,
         ptr: *mut (dyn Reclaim + 'domain),
         deleter: &'static dyn Deleter,
     ) {
+        // SAFETY: By safety contract on function.
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
         self.count.fetch_add(1, Ordering::Release);
-        self.untagged[calc_shard(retired)].push(retired);
+        // SAFETY: retired is valid pointers as it comes from box that we constructed.
+        unsafe { self.untagged[calc_shard(retired)].push(retired, retired) };
         if self.is_time_to_reclaim() || self.reached_threshold() {
             self.eager_reclaim(false);
         }
@@ -185,7 +213,7 @@ impl<F> Domain<F> {
             }
             node = next_node;
         }
-        unsafe { self.untagged[shard].append(remaining_head, remaining_tail) };
+        unsafe { self.untagged[shard].push(remaining_head, remaining_tail) };
 
         reclaimable
     }
@@ -197,6 +225,7 @@ impl<F> Domain<F> {
 
 struct HazPtrRecords {
     head: AtomicPtr<HazPtrRecord>,
+    available: AtomicUsize, // *mut HazPtrRecord in reality.
     count: AtomicIsize,
 }
 
@@ -205,17 +234,95 @@ impl HazPtrRecords {
         self.count.load(Ordering::Acquire)
     }
 
-    fn acquire_existing(&self) -> Option<&HazPtrRecord> {
-        let mut node = self.head.load(Ordering::Acquire);
-        while !node.is_null() {
-            // Try to acquire existing.
-            let n = unsafe { &*node };
-            if n.maybe_activate() {
-                return Some(n);
+    fn cas_available(&self, current: usize, new: usize) -> bool {
+        self.available
+            .compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn try_acquire_available<const N: usize>(&self) -> *mut HazPtrRecord {
+        loop {
+            let available = self.available.load(Ordering::Acquire);
+            if available == std::ptr::null::<HazPtrRecord>() as usize {
+                return std::ptr::null_mut();
             }
-            node = n.next;
+            if (available as usize & LOCK_BIT) == 0 {
+                // Not locked at the moment
+                if self.cas_available(available, available as usize | LOCK_BIT) {
+                    // SAFETY: We hold lock now.
+                    break unsafe {
+                        self.try_acquire_available_locked::<N>(available as *mut HazPtrRecord)
+                    };
+                } else {
+                    std::thread::yield_now();
+                }
+            }
         }
-        None
+    }
+
+    /// # Safety
+    ///
+    /// 1. Must already hold the lock for available HazPtrRecord.
+    /// 2. head must point to a valid non null pointer.
+    unsafe fn try_acquire_available_locked<const N: usize>(
+        &self,
+        head: *mut HazPtrRecord,
+    ) -> *mut HazPtrRecord {
+        let mut tail = head;
+        let mut n = 1;
+        // SAFETY: tail is head, which is valid via function contract.
+        let mut next = unsafe { &*tail }.next_available;
+        while !next.is_null() && n < N {
+            debug_assert_eq!(next as usize & LOCK_BIT, 0);
+            tail = next;
+            // SAFETY: every non locked pointer is valid in available list.
+            next = unsafe { &*tail }.next_available;
+            n += 1;
+        }
+
+        let new_available_head = next as usize;
+        debug_assert_eq!(new_available_head & LOCK_BIT, 0); // check valid pointer.
+        self.available.store(new_available_head, Ordering::Release); // release lock.
+
+        // SAFETY: every non locked pointer is valid in available list.
+        unsafe { &mut *tail }.next_available = std::ptr::null_mut();
+
+        head
+    }
+
+    fn link_and_clean<const N: usize>(
+        recs: [&HazPtrRecord; N],
+    ) -> Option<(&HazPtrRecord, &HazPtrRecord)> {
+        if recs.is_empty() {
+            return None;
+        }
+        recs.iter().for_each(|rec| rec.reset());
+        recs.windows(2).for_each(|w| {
+            let rec: *mut HazPtrRecord = w[0] as *const _ as *mut _;
+            unsafe { &mut *rec }.next_available = w[1] as *const _ as *mut _;
+        });
+        if cfg!(debug_assertion) {
+            (0..N).for_each(|i| debug_assert_eq!((recs[i] as *const _ as usize) & LOCK_BIT, 0));
+        }
+        Some((recs[0], *recs.last().unwrap()))
+    }
+
+    fn push_available<const N: usize>(&self, recs: [&HazPtrRecord; N]) {
+        if let Some((head, tail)) = Self::link_and_clean(recs) {
+            let tail: *mut HazPtrRecord = tail as *const _ as *mut _;
+            debug_assert_eq!((head as *const _ as usize) & LOCK_BIT, 0);
+            loop {
+                let available = self.available.load(Ordering::Acquire);
+                if (available & LOCK_BIT) == 0 {
+                    unsafe { &mut *tail }.next_available = available as *mut HazPtrRecord;
+                    if self.cas_available(available, head as *const _ as usize) {
+                        break;
+                    }
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// Allocate a new HazPtr.
@@ -223,7 +330,7 @@ impl HazPtrRecords {
         let hazptr = Box::into_raw(Box::new(HazPtrRecord {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
             next: std::ptr::null_mut(),
-            active: AtomicBool::new(true),
+            next_available: std::ptr::null_mut(),
         }));
         self.count.fetch_add(1, Ordering::Release);
         let mut head = self.head.load(Ordering::Acquire);
@@ -245,9 +352,7 @@ impl HazPtrRecords {
         let mut node = self.head.load(Ordering::Acquire);
         while !node.is_null() {
             let n = unsafe { &*node };
-            if n.is_active() {
-                protected.insert(n.ptr.load(Ordering::Acquire));
-            }
+            protected.insert(n.ptr.load(Ordering::Acquire));
             node = n.next;
         }
         protected
@@ -311,16 +416,11 @@ impl RetiredList {
         self.head.load(Ordering::Acquire).is_null()
     }
 
-    fn push(&self, retired: *mut Retired) {
-        // SAFETY: pointers are valid since we own them.
-        unsafe { self.append(retired, retired) };
-    }
-
     /// This does not alter count which should be taken care by the caller.
     ///
     /// Safety:
     /// 1. Caller sould ensure that `beg` and `end` corresponds to a valid linked list.
-    unsafe fn append(&self, beg: *mut Retired, end: *mut Retired) {
+    unsafe fn push(&self, beg: *mut Retired, end: *mut Retired) {
         if beg.is_null() {
             return;
         }

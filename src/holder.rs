@@ -72,6 +72,6 @@ impl<'domain, F> HazardPointer<'domain, F> {
 
 impl<F> Drop for HazardPointer<'_, F> {
     fn drop(&mut self) {
-        self.hazard.release();
+        self.domain.release(self.hazard);
     }
 }
