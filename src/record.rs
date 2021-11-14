@@ -15,3 +15,35 @@ impl HazPtrRecord {
         self.ptr.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HazPtrRecord;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    fn new(ptr: *mut ()) -> HazPtrRecord {
+        HazPtrRecord {
+            ptr: AtomicPtr::new(ptr),
+            next: std::ptr::null_mut(),
+            next_available: std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn test_protect() {
+        let ptr = new(std::ptr::null_mut());
+        let mut x: usize = 4;
+        let y: *mut usize = &mut x;
+        ptr.protect(y as *mut ());
+        unsafe { assert_eq!(4, *(ptr.ptr.load(Ordering::Relaxed) as *mut usize)) };
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut x: usize = 4;
+        let y: *mut usize = &mut x;
+        let ptr = new(y as *mut ());
+        ptr.reset();
+        assert!(ptr.ptr.load(Ordering::Relaxed).is_null());
+    }
+}
