@@ -6,6 +6,7 @@ pub mod domain;
 pub mod holder;
 pub mod object;
 mod record;
+mod sync;
 
 use std::sync::atomic::Ordering;
 

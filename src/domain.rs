@@ -491,3 +491,41 @@ struct GlobalReaderLocalWriterShouldNotCompile;
 /// ```
 #[cfg(doctest)]
 struct DomainWithDifferentFamilyShouldNotCompile;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire() {
+        let domain = unique_domain!();
+        let _: &HazPtrRecord = domain.acquire();
+        assert_eq!(1, domain.hazptrs.count.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn acquire_reuses_released_pointers() {
+        let domain = unique_domain!();
+        let ptr = domain.acquire();
+        domain.release(ptr);
+        domain.acquire();
+
+        assert_eq!(1, domain.hazptrs.count.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn acquire_many() {
+        let domain = unique_domain!();
+        let _: [&HazPtrRecord; 10] = domain.acquire_many::<10>();
+        assert_eq!(10, domain.hazptrs.count.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn acquire_many_reuses_released_pointers() {
+        let domain = unique_domain!();
+        let ptrs: [&HazPtrRecord; 10] = domain.acquire_many::<10>();
+        (0..5).for_each(|i| domain.release(ptrs[i]));
+        let _: [&HazPtrRecord; 10] = domain.acquire_many::<10>();
+        assert_eq!(15, domain.hazptrs.count.load(Ordering::Relaxed));
+    }
+}
