@@ -7,6 +7,7 @@ pub mod holder;
 pub mod object;
 mod record;
 mod sync;
+mod thread;
 
 use std::sync::atomic::Ordering;
 
@@ -18,7 +19,7 @@ pub use holder::HazardPointer;
 pub use object::{HazPtrObject, HazPtrObjectWrapper};
 
 pub(crate) fn asymmetric_light_barrier() {
-    std::sync::atomic::fence(Ordering::SeqCst);
+    crate::sync::atomic::fence(Ordering::SeqCst);
 }
 
 pub(crate) enum HeavyBarrierKind {
@@ -26,5 +27,5 @@ pub(crate) enum HeavyBarrierKind {
 }
 
 pub(crate) fn asymmetric_heavy_barrier(_: HeavyBarrierKind) {
-    std::sync::atomic::fence(Ordering::SeqCst);
+    crate::sync::atomic::fence(Ordering::SeqCst);
 }

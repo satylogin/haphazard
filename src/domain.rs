@@ -1,8 +1,9 @@
 use crate::deleter::{Deleter, Reclaim};
 use crate::record::HazPtrRecord;
+use crate::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize};
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as u64;
@@ -38,7 +39,13 @@ impl Global {
     }
 }
 
+#[cfg(not(loom))]
 static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
+}
 
 pub struct Domain<F> {
     hazptrs: HazPtrRecords,
@@ -62,22 +69,43 @@ macro_rules! unique_domain {
     };
 }
 
-impl<F> Domain<F> {
-    pub const fn new(_: &F) -> Self {
-        const RETIRED_LIST: RetiredList = RetiredList::new();
-        Self {
-            hazptrs: HazPtrRecords {
-                head: AtomicPtr::new(std::ptr::null_mut()),
-                available: AtomicUsize::new(0),
+macro_rules! new {
+    ($($decl:tt)*) => {
+        pub $($decl)* new(_: &F) -> Self {
+
+            #[cfg(not(loom))]
+            let untagged = {
+                const RETIRED_LIST: RetiredList = RetiredList::new();
+                [RETIRED_LIST; NUM_SHARDS]
+            };
+
+            #[cfg(loom)]
+            let untagged = {
+                [(); NUM_SHARDS].map(|_| RetiredList::new())
+            };
+
+            Self {
+                hazptrs: HazPtrRecords {
+                    head: AtomicPtr::new(std::ptr::null_mut()),
+                    available: AtomicUsize::new(0),
+                    count: AtomicIsize::new(0),
+                },
+                untagged,
+                family: PhantomData,
+                due_time: AtomicU64::new(0),
                 count: AtomicIsize::new(0),
-            },
-            untagged: [RETIRED_LIST; NUM_SHARDS],
-            family: PhantomData,
-            due_time: AtomicU64::new(0),
-            count: AtomicIsize::new(0),
-            shutdown: false,
+                shutdown: false,
+            }
         }
-    }
+    };
+}
+
+impl<F> Domain<F> {
+    #[cfg(loom)]
+    new!(fn);
+
+    #[cfg(not(loom))]
+    new!(const fn);
 
     pub(crate) fn acquire(&self) -> &HazPtrRecord {
         self.acquire_many::<1>()[0]
@@ -164,7 +192,7 @@ impl<F> Domain<F> {
             if self.untagged[shard].is_empty() || !transitive {
                 break;
             } else {
-                std::thread::yield_now();
+                crate::thread::yield_now();
             }
         }
         if reclaimed != 0 {
@@ -254,7 +282,7 @@ impl HazPtrRecords {
                         self.try_acquire_available_locked::<N>(available as *mut HazPtrRecord)
                     };
                 } else {
-                    std::thread::yield_now();
+                    crate::thread::yield_now();
                 }
             }
         }
@@ -319,7 +347,7 @@ impl HazPtrRecords {
                         break;
                     }
                 } else {
-                    std::thread::yield_now();
+                    crate::thread::yield_now();
                 }
             }
         }
@@ -361,7 +389,7 @@ impl HazPtrRecords {
 
 impl Drop for HazPtrRecords {
     fn drop(&mut self) {
-        let mut node = *self.head.get_mut();
+        let mut node = self.head.load(Ordering::Acquire);
         while !node.is_null() {
             node = unsafe { Box::from_raw(node) }.next;
         }
@@ -371,7 +399,7 @@ impl Drop for HazPtrRecords {
 impl<F> Drop for Domain<F> {
     fn drop(&mut self) {
         self.shutdown = true;
-        let n_retired = *self.count.get_mut();
+        let n_retired = self.count.load(Ordering::Acquire);
         let n_reclaimed = self.eager_reclaim(true);
         debug_assert_eq!(n_retired, n_reclaimed);
     }
@@ -406,6 +434,14 @@ struct RetiredList {
 }
 
 impl RetiredList {
+    #[cfg(loom)]
+    fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    #[cfg(not(loom))]
     const fn new() -> Self {
         Self {
             head: AtomicPtr::new(std::ptr::null_mut()),

@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicPtr, Ordering};
+use crate::sync::atomic::AtomicPtr;
+use std::sync::atomic::Ordering;
 
 pub(crate) struct HazPtrRecord {
     pub(crate) ptr: AtomicPtr<()>,
