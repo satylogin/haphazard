@@ -85,3 +85,53 @@ fn panics_when_domain_mismatch_between_reader_and_writer() {
     let h = HazardPointer::make_in_domain(&dr);
     let _ = unsafe { h.protect(&x) }.unwrap();
 }
+
+#[test]
+fn drop_domain() {
+    let domain = haphazard::unique_domain!();
+
+    let drops_42 = Arc::new(AtomicUsize::new(0));
+    let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(
+        &domain,
+        (42, CountDrops(Arc::clone(&drops_42))),
+    ))));
+
+    // As a reader:
+    let h = HazardPointer::make_in_domain(&domain);
+    let my_x = unsafe { h.protect(&x) }.unwrap();
+    assert_eq!(42, my_x.0);
+
+    // As a writer:
+    let drops_9001 = Arc::new(AtomicUsize::new(0));
+    let old = x.swap(
+        Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(
+            &domain,
+            (9001, CountDrops(Arc::clone(&drops_9001))),
+        ))),
+        Ordering::SeqCst,
+    );
+    let h2 = HazardPointer::make_in_domain(&domain);
+    let my_x2 = unsafe { h2.protect(&x) }.unwrap();
+    assert_eq!(42, my_x.0);
+    assert_eq!(9001, my_x2.0);
+
+    unsafe { old.retire(&deleter::drop_box) };
+    assert_eq!(42, my_x.0);
+    assert_eq!(0, drops_42.load(Ordering::SeqCst));
+
+    assert_eq!(0, domain.eager_reclaim(false));
+    assert_eq!(42, my_x.0);
+    assert_eq!(0, drops_42.load(Ordering::SeqCst));
+
+    drop(h);
+    assert_eq!(0, drops_42.load(Ordering::SeqCst));
+    assert_eq!(1, domain.eager_reclaim(false));
+    assert_eq!(1, drops_42.load(Ordering::SeqCst));
+    assert_eq!(0, drops_9001.load(Ordering::SeqCst));
+
+    drop(h2);
+    assert_eq!(0, domain.eager_reclaim(false));
+    assert_eq!(0, drops_9001.load(Ordering::SeqCst));
+
+    drop(domain);
+}
