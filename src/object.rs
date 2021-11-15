@@ -9,9 +9,9 @@ where
 {
     fn domain(&self) -> &'domain Domain<F>;
 
-    unsafe fn retire(self: *mut Self, deleter: &'static dyn Deleter) {
+    unsafe fn retire(self: *mut Self, deleter: &'static dyn Deleter) -> isize {
         let ptr = self as *mut (dyn Reclaim + 'domain);
-        unsafe { (&*self).domain().retire(ptr, deleter) };
+        unsafe { (&*self).domain().retire(ptr, deleter) }
     }
 }
 

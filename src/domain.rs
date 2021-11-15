@@ -10,11 +10,13 @@ const RECLAIM_TIME_PERIOD: u64 = Duration::from_nanos(2000000000).as_nanos() as 
 const RCOUNT_THRESHOLD: isize = 1000;
 const HCOUNT_MULTIPLIER: isize = 2;
 const NUM_SHARDS: usize = 8;
+#[cfg(not(loom))]
 const IGNORE_LOW_BITS: usize = 8;
 const SHARD_MASK: usize = NUM_SHARDS - 1;
 const LOCK_BIT: usize = 1;
 
 /// Returns system time in nano sec as u64
+#[cfg(not(loom))]
 fn unix_epoc_nano() -> u64 {
     use std::convert::TryFrom;
 
@@ -27,8 +29,19 @@ fn unix_epoc_nano() -> u64 {
     .expect("system time is too far in future")
 }
 
+#[cfg(loom)]
+fn unix_epoc_nano() -> u64 {
+    0
+}
+
+#[cfg(not(loom))]
 fn calc_shard(input: *mut Retired) -> usize {
     (input as usize >> IGNORE_LOW_BITS) & SHARD_MASK
+}
+
+#[cfg(loom)]
+fn calc_shard(_: *mut Retired) -> usize {
+    SHARD.fetch_add(1, Ordering::Relaxed) & SHARD_MASK
 }
 
 #[non_exhaustive]
@@ -45,6 +58,7 @@ static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
 #[cfg(loom)]
 loom::lazy_static! {
     static ref SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
+    static ref SHARD: loom::sync::atomic::AtomicUsize = loom::sync::atomic::AtomicUsize::new(0);
 }
 
 pub struct Domain<F> {
@@ -142,14 +156,16 @@ impl<F> Domain<F> {
         &'domain self,
         ptr: *mut (dyn Reclaim + 'domain),
         deleter: &'static dyn Deleter,
-    ) {
+    ) -> isize {
         // SAFETY: By safety contract on function.
         let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
         self.count.fetch_add(1, Ordering::Release);
         // SAFETY: retired is valid pointers as it comes from box that we constructed.
         unsafe { self.untagged[calc_shard(retired)].push(retired, retired) };
         if self.is_time_to_reclaim() || self.reached_threshold() {
-            self.eager_reclaim(false);
+            self.eager_reclaim(false)
+        } else {
+            0
         }
     }
 
